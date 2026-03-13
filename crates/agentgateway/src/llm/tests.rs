@@ -227,7 +227,7 @@ mod requests {
 			|i| conversion::bedrock::from_messages::translate(&i, &bedrock_provider, None);
 		let vertex_request = |input: types::messages::Request| -> Result<Vec<u8>, AIError> {
 			let anthropic_body = serde_json::to_vec(&input).map_err(AIError::RequestMarshal)?;
-			vertex_provider.prepare_anthropic_message_body(anthropic_body)
+			vertex_provider.prepare_anthropic_message_body(anthropic_body, None)
 		};
 		let completions_request = |i| conversion::completions::from_messages::translate(&i);
 		for (name, providers) in MESSAGES_REQUESTS {

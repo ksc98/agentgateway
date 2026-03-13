@@ -5,7 +5,112 @@ use serde_json::{Map, Value};
 use crate::llm::{AIError, RouteType};
 use crate::*;
 
+use super::policy::PromptCachingConfig;
+
 const ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
+fn make_cache_control() -> Value {
+	serde_json::json!({"type": "ephemeral"})
+}
+
+/// Estimate token count from text using a rough heuristic (~1.3 tokens per word).
+fn estimate_tokens(text: &str) -> usize {
+	(text.split_whitespace().count() * 13) / 10
+}
+
+/// Apply prompt caching markers (`cache_control`) to an Anthropic Messages API body.
+///
+/// Inserts `{"type": "ephemeral"}` cache_control on:
+/// - The last system content block (if `cache_system` is true and meets `min_tokens`)
+/// - The second-to-last message (if `cache_messages` is true)
+/// - The last tool definition (if `cache_tools` is true)
+///
+/// Anthropic allows at most 4 explicit cache breakpoints per request.
+fn apply_prompt_caching(body: &mut Map<String, Value>, config: &PromptCachingConfig) {
+	let cc = make_cache_control();
+
+	// Cache system prompt: add cache_control to the last system content block
+	if config.cache_system {
+		if let Some(system) = body.get_mut("system") {
+			match system {
+				// String system prompt — convert to block format to attach cache_control
+				Value::String(text) => {
+					let meets_min = config
+						.min_tokens
+						.map_or(true, |min| estimate_tokens(text) >= min);
+					if meets_min {
+						*system = serde_json::json!([{
+							"type": "text",
+							"text": text.clone(),
+							"cache_control": cc,
+						}]);
+					}
+				},
+				// Array of system blocks — add cache_control to the last one
+				Value::Array(blocks) => {
+					let total_tokens: usize = blocks
+						.iter()
+						.filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+						.map(estimate_tokens)
+						.sum();
+					let meets_min = config.min_tokens.map_or(true, |min| total_tokens >= min);
+					if meets_min {
+						if let Some(last) = blocks.last_mut() {
+							if let Value::Object(obj) = last {
+								obj.insert("cache_control".to_string(), cc.clone());
+							}
+						}
+					}
+				},
+				_ => {},
+			}
+		}
+	}
+
+	// Cache messages: add cache_control to the last content block of the
+	// second-to-last message (caches conversation history before current turn)
+	if config.cache_messages {
+		if let Some(Value::Array(messages)) = body.get_mut("messages") {
+			let len = messages.len();
+			if len >= 2 {
+				if let Some(msg) = messages.get_mut(len - 2) {
+					insert_cache_control_on_last_content(msg, &cc);
+				}
+			}
+		}
+	}
+
+	// Cache tools: add cache_control to the last tool definition
+	if config.cache_tools {
+		if let Some(Value::Array(tools)) = body.get_mut("tools") {
+			if let Some(Value::Object(last_tool)) = tools.last_mut() {
+				last_tool.insert("cache_control".to_string(), cc.clone());
+			}
+		}
+	}
+}
+
+/// Insert cache_control on the last content block of a message.
+fn insert_cache_control_on_last_content(message: &mut Value, cc: &Value) {
+	if let Some(content) = message.get_mut("content") {
+		match content {
+			// String content — convert to block format
+			Value::String(text) => {
+				*content = serde_json::json!([{
+					"type": "text",
+					"text": text.clone(),
+					"cache_control": cc,
+				}]);
+			},
+			// Array of content blocks — add to last block
+			Value::Array(blocks) => {
+				if let Some(Value::Object(last)) = blocks.last_mut() {
+					last.insert("cache_control".to_string(), cc.clone());
+				}
+			},
+			_ => {},
+		}
+	}
+}
 
 #[apply(schema!)]
 pub struct Provider {
@@ -29,7 +134,11 @@ impl Provider {
 		self.anthropic_model(request_model).is_some()
 	}
 
-	pub fn prepare_anthropic_message_body(&self, body: Vec<u8>) -> Result<Vec<u8>, AIError> {
+	pub fn prepare_anthropic_message_body(
+		&self,
+		body: Vec<u8>,
+		prompt_caching: Option<&super::policy::PromptCachingConfig>,
+	) -> Result<Vec<u8>, AIError> {
 		let mut body: Map<String, Value> =
 			serde_json::from_slice(&body).map_err(AIError::RequestMarshal)?;
 
@@ -38,6 +147,10 @@ impl Provider {
 			Value::String(ANTHROPIC_VERSION.to_string()),
 		);
 		body.remove("model");
+
+		if let Some(caching) = prompt_caching {
+			apply_prompt_caching(&mut body, caching);
+		}
 
 		serde_json::to_vec(&body).map_err(AIError::RequestMarshal)
 	}
@@ -198,5 +311,124 @@ mod tests {
 		};
 		let actual = p.anthropic_model(req).map(|m| m.to_string());
 		assert_eq!(actual.as_deref(), expected);
+	}
+
+	#[test]
+	fn test_prompt_caching_system_string() {
+		let mut body: Map<String, Value> = serde_json::from_value(serde_json::json!({
+			"system": "You are a helpful assistant with a very long system prompt that should be cached.",
+			"messages": [
+				{"role": "user", "content": "Hello"},
+				{"role": "assistant", "content": "Hi there"},
+				{"role": "user", "content": "How are you?"}
+			]
+		}))
+		.unwrap();
+		let config = PromptCachingConfig {
+			cache_system: true,
+			cache_messages: true,
+			cache_tools: false,
+			min_tokens: None,
+		};
+		apply_prompt_caching(&mut body, &config);
+
+		// System should be converted to blocks with cache_control
+		let system = body.get("system").unwrap();
+		assert!(system.is_array());
+		let blocks = system.as_array().unwrap();
+		assert_eq!(blocks.len(), 1);
+		assert!(blocks[0].get("cache_control").is_some());
+
+		// Second-to-last message should have cache_control
+		let messages = body.get("messages").unwrap().as_array().unwrap();
+		let second_to_last = &messages[1];
+		let content = second_to_last.get("content").unwrap().as_array().unwrap();
+		assert!(content[0].get("cache_control").is_some());
+	}
+
+	#[test]
+	fn test_prompt_caching_system_blocks() {
+		let mut body: Map<String, Value> = serde_json::from_value(serde_json::json!({
+			"system": [
+				{"type": "text", "text": "First block"},
+				{"type": "text", "text": "Second block"}
+			],
+			"messages": [
+				{"role": "user", "content": "Hello"}
+			]
+		}))
+		.unwrap();
+		let config = PromptCachingConfig {
+			cache_system: true,
+			cache_messages: false,
+			cache_tools: false,
+			min_tokens: None,
+		};
+		apply_prompt_caching(&mut body, &config);
+
+		let blocks = body.get("system").unwrap().as_array().unwrap();
+		assert!(blocks[0].get("cache_control").is_none());
+		assert!(blocks[1].get("cache_control").is_some());
+	}
+
+	#[test]
+	fn test_prompt_caching_tools() {
+		let mut body: Map<String, Value> = serde_json::from_value(serde_json::json!({
+			"messages": [{"role": "user", "content": "Hello"}],
+			"tools": [
+				{"name": "tool1", "description": "First tool", "input_schema": {}},
+				{"name": "tool2", "description": "Second tool", "input_schema": {}}
+			]
+		}))
+		.unwrap();
+		let config = PromptCachingConfig {
+			cache_system: false,
+			cache_messages: false,
+			cache_tools: true,
+			min_tokens: None,
+		};
+		apply_prompt_caching(&mut body, &config);
+
+		let tools = body.get("tools").unwrap().as_array().unwrap();
+		assert!(tools[0].get("cache_control").is_none());
+		assert!(tools[1].get("cache_control").is_some());
+	}
+
+	#[test]
+	fn test_prompt_caching_min_tokens_not_met() {
+		let mut body: Map<String, Value> = serde_json::from_value(serde_json::json!({
+			"system": "Short prompt",
+			"messages": [{"role": "user", "content": "Hello"}]
+		}))
+		.unwrap();
+		let config = PromptCachingConfig {
+			cache_system: true,
+			cache_messages: false,
+			cache_tools: false,
+			min_tokens: Some(1024),
+		};
+		apply_prompt_caching(&mut body, &config);
+
+		// System should remain a string (min_tokens not met)
+		assert!(body.get("system").unwrap().is_string());
+	}
+
+	#[test]
+	fn test_prompt_caching_too_few_messages() {
+		let mut body: Map<String, Value> = serde_json::from_value(serde_json::json!({
+			"messages": [{"role": "user", "content": "Hello"}]
+		}))
+		.unwrap();
+		let config = PromptCachingConfig {
+			cache_system: false,
+			cache_messages: true,
+			cache_tools: false,
+			min_tokens: None,
+		};
+		apply_prompt_caching(&mut body, &config);
+
+		// With only 1 message, no cache_control should be added
+		let messages = body.get("messages").unwrap().as_array().unwrap();
+		assert!(messages[0].get("content").unwrap().is_string());
 	}
 }

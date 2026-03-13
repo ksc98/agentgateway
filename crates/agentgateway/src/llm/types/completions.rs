@@ -217,7 +217,7 @@ impl super::RequestType for Request {
 	fn to_vertex(&self, provider: &crate::llm::vertex::Provider) -> Result<Vec<u8>, AIError> {
 		if provider.is_anthropic_model(self.model.as_deref()) {
 			let body = self.to_anthropic()?;
-			provider.prepare_anthropic_message_body(body)
+			provider.prepare_anthropic_message_body(body, None)
 		} else {
 			self.to_openai()
 		}

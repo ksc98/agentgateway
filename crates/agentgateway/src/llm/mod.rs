@@ -773,7 +773,10 @@ impl AIProvider {
 			match self {
 				AIProvider::Vertex(provider) if provider.is_anthropic_model(Some(request_model)) => {
 					let body = req.to_anthropic()?;
-					provider.prepare_anthropic_message_body(body)?
+					provider.prepare_anthropic_message_body(
+						body,
+						policies.and_then(|p| p.prompt_caching.as_ref()),
+					)?
 				},
 				AIProvider::OpenAI(_) | AIProvider::Gemini(_) | AIProvider::AzureOpenAI(_) => {
 					req.to_openai()?
